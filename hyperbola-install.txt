@@ -1,0 +1,135 @@
+ // Check internet connection
+ping fsf.org
+
+// Wipe luks headers
+head -c 3145728 /dev/urandom > /dev/sdX; sync
+
+// Enable usage of cryptsetup
+modprobe dm-mod
+
+// Format disk as DOS, with one partition using all available space
+cfdisk /dev/sda
+
+// Create the crypt volume
+cryptsetup -v --cipher serpent-xts-plain64 --key-size 512 --hash whirlpool \
+--use-random --verify-passphrase luksFormat /dev/sda1
+// With this setup, it takes my computer several minutes to recognize the crypt partition at boot.
+// If you would prefer a speedier boot time, try adding the '--iter-time 500' option, maybe with an even smaller number.
+
+// Open crypt volume
+cryptsetup luksOpen /dev/sda1 lvm
+
+// Create lvm partition
+pvcreate /dev/mapper/lvm
+pvdisplay
+
+// Create volume group
+vgcreate matrix /dev/mapper/lvm
+vgdisplay
+
+// Add swap and root partitions (change the '6G' if you want a different swapfile size)
+lvcreate -L 6G matrix -n swapvol
+lvcreate -l +100%FREE matrix -n rootvol
+lvdisplay
+
+// Format swap partition
+mkswap /dev/mapper/matrix-swapvol
+swapon /dev/mapper/matrix-swapvol
+
+// Format root partition
+mkfs.ext4 /dev/mapper/matrix-rootvol
+
+// Mount root partition
+mount /dev/matrix/rootvol /mnt
+
+// Create base directories
+mkdir -p /mnt/home
+mkdir -p /mnt/boot
+
+// Verify date is correct
+date
+
+// Update pacman keyring
+pacman-key --init
+pacman-key --populate hyperbola arch
+pacman-key --refresh-keys
+
+// Update mirrorlist, moving preferred mirrors to the top
+nano /etc/pacman.d/mirrorlist
+
+// Install base system, as well as grub, doas, and wpa_supplicant
+pacstrap /mnt base grub wpa_supplicant doas
+
+// Generate fstab file
+genfstab -U -p /mnt >> /mnt/etc/fstab
+cat /mnt/etc/fstab
+
+// Create the crypttab file
+nano /mnt/etc/crypttab
+ // cryptboot	/dev/sda1	none	luks
+
+// Chroot into the new system
+arch-chroot /mnt
+
+// Generate locale
+nano /etc/locale.gen
+locale-gen
+echo LANG=en_US.UTF-8 > /etc/locale.conf
+export LANG=en_US.UTF-8
+
+// Set timezone and sync hardware clock
+ln -s /usr/share/zoneinfo/America/Los_Angeles /etc/localtime
+hwclock --systohc --utc
+
+// Configure kernel modules to allow unlocking crypt volume on boot
+nano /etc/mkinitcpio.conf
+ // MODULES="i915 hid-generic hid hid-apple"
+ // HOOKS="base udev autodetect modconf block keyboard keymap consolefont encrypt lvm2 filesystems fsck shutdown"
+mkinitcpio -p linux-libre-lts
+
+// Set up hostname and add it to the end of the bottom two lines (change 'HOSTNAME' to the name of your system)
+echo HOSTNAME > /etc/hostname
+nano /etc/hosts
+
+// Set up wireless (replace 'INTERFACE' with the name of your wifi interface, which should be returned by the first command.
+// Mine was 'wlp2s0' but I'm not sure if it will be the same for others.
+// Also make sure to replace 'SSID' and 'PASSWORD' with your network's name and password.)
+ip link show
+rc-update add dhcpcd default
+rc-service dhcpcd start
+wpa_supplicant -B -i INTERFACE -c <(wpa_passphrase SSID PASSWORD)
+dhcpcd INTERFACE
+
+// Set root password and configure non-root user (replace 'USERNAME' with your username
+passwd
+useradd -m -G wheel USERNAME
+passwd USERNAME
+nano /etc/doas.conf
+ // Change 'permit :wheel' to 'permit persist :wheel'
+
+// Extra security tweaks
+nano /etc/pam.d/passwd
+ // Add 'rounds=65536 to the last line, like so: 'password	required	pam_unix.so sha512 shadow nullok rounds=65536'
+chmod 700 /boot /etc/{iptables,arptables} // iptables and arptables don't seem to exist to me, but better safe than sorry
+nano /etc/pam.d/system-login
+ // change 'auth required pam_tally.so	deny=2 unlock_time=600 onerr=succeed file=/var/log/faillog'
+ // to 'auth required pam_tally.so	deny=2 unlock_time=600 onerr=succeed file=/var/log/faillog'
+
+// Configure grub to unlock crypt volume
+blkid >> /etc/default/grub // This will put a list of UUIDs at the end of the file. Copy the UUID that corrisponds to the partition you made
+// (likely sda1, but don't trust me on that) and paste it in place of the 'UUIDGOESHERE' Don't forget to delete the other entries afterwards, otherwise grub gets mad.
+nano /etc/default/grub
+ // edit the 'GRUB_CMDLINE_LINUX_DEFAULT' line to 'GRUB_CMDLINE_LINUX_DEFAULT="quiet cryptdevice=UUID=UUIDGOESHERE:lvm"'
+ // uncomment 'GRUB_PRELOAD_MODULES=lvm'
+ // uncomment 'GRUB_ENABLE_CRYPTODISK=y'
+grub-install --no-bootsector /dev/sda
+grub-mkconfig -o /boot/grub/grub.cfg
+
+// Exit, unmount, and shutdown
+exit
+umount -R /mnt
+swapoff -a
+lvchange -an /dev/matrix/rootvol
+lvchange -an /dev/matrix/swapvol
+cryptsetup luksClose lvm
+poweroff
